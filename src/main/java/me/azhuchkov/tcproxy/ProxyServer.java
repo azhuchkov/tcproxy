@@ -5,15 +5,14 @@ import me.azhuchkov.tcproxy.channel.ServerSocketChannelFactory;
 import me.azhuchkov.tcproxy.channel.SocketChannelFactory;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
-import java.net.StandardSocketOptions;
+import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.Iterator;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -252,12 +251,61 @@ public class ProxyServer {
         }
     }
 
-    public static void main(String[] args) throws IOException {
-        ProxyServer server = new ProxyServer(new InetSocketAddress(8080), 10);
+    public static void main(String[] args) {
+        final Logger logger = Logger.getLogger("");
 
-        server.start();
+        String configUrl0 = System.getProperty("tcproxy.config.url", "classpath:/proxy.properties");
 
-        System.out.println("Yahooo!!! Server has been started!");
+        URL configUrl = null;
+        try {
+            configUrl = configUrl0.startsWith("classpath:") ?
+                    ProxyServer.class.getResource(configUrl0.substring(10)):
+                    new URL(configUrl0);
+
+            if (configUrl == null)
+                throw new MalformedURLException("Couldn't find " + configUrl0);
+        } catch (MalformedURLException e) {
+            logger.log(Level.SEVERE, "Failed to resolve configuration URL address", e);
+
+            System.exit(1);
+        }
+
+        PropertiesConfig config = null;
+
+        try {
+            config = PropertiesConfig.parse(configUrl);
+        } catch (ConfigurationException | IOException e) {
+            final String message = e instanceof IOException ?
+                    "Failed to read configuration" :
+                    "Configuration error";
+
+            logger.log(Level.SEVERE, message, e);
+
+            System.exit(1);
+        }
+
+        if (config.mappings().isEmpty()) {
+            logger.severe("There is no TCP mappings have been configured. Please add something.");
+
+            System.exit(1);
+        }
+
+        PortMapping first = config.mappings().iterator().next();
+
+        ProxyServer server =
+                new ProxyServer(first.localAddress(), Integer.getInteger("tcproxy.accept.backlog", -1));
+
+        logger.info("Starting TCP proxy server...");
+
+        try {
+            server.start();
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Failed to start server", e);
+
+            System.exit(2);
+        }
+
+        logger.info("The server has been started successfully");
 
 //        server.shutdown();
     }
