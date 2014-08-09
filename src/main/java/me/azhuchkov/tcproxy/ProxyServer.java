@@ -3,6 +3,8 @@ package me.azhuchkov.tcproxy;
 import me.azhuchkov.tcproxy.channel.NetworkChannelFactory;
 import me.azhuchkov.tcproxy.channel.ServerSocketChannelFactory;
 import me.azhuchkov.tcproxy.channel.SocketChannelFactory;
+import me.azhuchkov.tcproxy.config.Configuration;
+import me.azhuchkov.tcproxy.config.ConfigurationException;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -294,10 +296,10 @@ public class ProxyServer {
             System.exit(1);
         }
 
-        PropertiesConfig config = null;
+        Configuration config = null;
 
         try {
-            config = PropertiesConfig.parse(configUrl);
+            config = Configuration.parse(configUrl);
         } catch (ConfigurationException | IOException e) {
             final String message = e instanceof IOException ?
                     "Failed to read configuration" :
