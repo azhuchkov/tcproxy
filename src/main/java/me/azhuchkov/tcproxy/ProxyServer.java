@@ -1,8 +1,13 @@
 package me.azhuchkov.tcproxy;
 
+import me.azhuchkov.tcproxy.channel.NetworkChannelFactory;
+import me.azhuchkov.tcproxy.channel.ServerSocketChannelFactory;
+import me.azhuchkov.tcproxy.channel.SocketChannelFactory;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
@@ -26,7 +31,12 @@ public class ProxyServer {
     /**
      * Server socket channel factory.
      */
-    private final ServerSocketChannelFactory factory;
+    private final NetworkChannelFactory<ServerSocketChannel> serverSocketFactory;
+
+    /**
+     * Socket channel factory.
+     */
+    private final NetworkChannelFactory<SocketChannel> socketFactory;
 
     /**
      * Socket address to bind.
@@ -54,16 +64,32 @@ public class ProxyServer {
     private volatile Selector selector;
 
     /**
+     * Main background thread that manages all the events.
+     */
+    private final ConnectionManager connectionManager = new ConnectionManager("connection-manager");
+
+    /**
+     * todo
+     * @param address
+     * @param backlog
+     */
+    public ProxyServer(SocketAddress address, int backlog) {
+        this(ServerSocketChannelFactory.DEFAULT, address, backlog, SocketChannelFactory.DEFAULT);
+    }
+
+    /**
      * Creates new instance of proxy server.
      *
-     * @param factory Factory for creating server socket channels.
+     * @param serverSocketFactory Factory for creating server socket channels.
      * @param address Bind address.
      * @param backlog Maximum number of pending connections. If value is 0 or less, OS default value will be used.
      */
-    public ProxyServer(ServerSocketChannelFactory factory, SocketAddress address, int backlog) {
-        this.factory = factory;
+    public ProxyServer(NetworkChannelFactory<ServerSocketChannel> serverSocketFactory, SocketAddress address, int backlog,
+                       NetworkChannelFactory<SocketChannel> socketChannelFactory) {
+        this.serverSocketFactory = serverSocketFactory;
         this.address = address;
         this.backlog = backlog;
+        this.socketFactory = socketChannelFactory;
     }
 
     /**
@@ -82,7 +108,7 @@ public class ProxyServer {
             if (this.channel != null)
                 throw new IllegalStateException("Server already started");
 
-            this.channel = channel0 = factory.newChannel();
+            this.channel = channel0 = serverSocketFactory.newChannel();
         }
 
         channel0.configureBlocking(false);
@@ -95,7 +121,7 @@ public class ProxyServer {
 
         LOGGER.info("Start listening on " + address + " with backlog: " + backlog);
 
-        new ConnectionManager("manager").start();
+        connectionManager.start();
     }
 
     /**
@@ -115,11 +141,13 @@ public class ProxyServer {
 
             channel0.close();
         }
+
+        connectionManager.interrupt();
     }
 
     private void onAccept(SelectionKey key) throws IOException {
         SocketChannel acceptedChannel = channel.accept();
-        SocketChannel mappedChannel = SocketChannel.open();
+        SocketChannel mappedChannel = socketFactory.newChannel();
 
         acceptedChannel.configureBlocking(false);
         acceptedChannel.register(selector, SelectionKey.OP_READ, mappedChannel);
@@ -130,7 +158,7 @@ public class ProxyServer {
                 SelectionKey.OP_CONNECT | SelectionKey.OP_READ,
                 acceptedChannel);
 
-        InetSocketAddress remote = new InetSocketAddress("odnoklassniki.ru", 80);
+        InetSocketAddress remote = new InetSocketAddress("ya.ru", 80);
 
         if (remote.isUnresolved()) {
             LOGGER.severe("Closing connection due to failed to resolve remote: " + remote);
@@ -225,11 +253,12 @@ public class ProxyServer {
     }
 
     public static void main(String[] args) throws IOException {
-        ProxyServer server =
-                new ProxyServer(ServerSocketChannelFactory.DEFAULT, new InetSocketAddress(8080), 10);
+        ProxyServer server = new ProxyServer(new InetSocketAddress(8080), 10);
 
         server.start();
 
         System.out.println("Yahooo!!! Server has been started!");
+
+//        server.shutdown();
     }
 }
