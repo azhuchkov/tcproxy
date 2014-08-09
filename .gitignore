@@ -1,0 +1,7 @@
+#
+# Patterns to not track by Git
+#
+.gradle/
+.idea/
+build/
+*.iml
