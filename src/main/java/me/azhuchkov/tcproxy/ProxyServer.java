@@ -5,13 +5,19 @@ import me.azhuchkov.tcproxy.channel.ServerSocketChannelFactory;
 import me.azhuchkov.tcproxy.channel.SocketChannelFactory;
 
 import java.io.IOException;
-import java.net.*;
+import java.net.InetSocketAddress;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -25,7 +31,7 @@ public class ProxyServer {
     /**
      * Logger.
      */
-    private static final Logger LOGGER = Logger.getLogger("PROXY");
+    private static final Logger LOGGER = Logger.getLogger(ProxyServer.class.getName());
 
     /**
      * Server socket channel factory.
@@ -38,19 +44,19 @@ public class ProxyServer {
     private final NetworkChannelFactory<SocketChannel> socketFactory;
 
     /**
-     * Socket address to bind.
+     * TCP port mappings.
      */
-    private final SocketAddress address;
+    private final Collection<PortMapping> mappings;
+
+    /**
+     * todo
+     */
+    private final ConcurrentMap<ServerSocketChannel, PortMapping> channels = new ConcurrentHashMap<>();
 
     /**
      * Maximum number of pending connections.
      */
     private final int backlog;
-
-    /**
-     * todo
-     */
-    private volatile ServerSocketChannel channel;
 
     /**
      * Server lifecycle mutex.
@@ -65,30 +71,35 @@ public class ProxyServer {
     /**
      * Main background thread that manages all the events.
      */
-    private final ConnectionManager connectionManager = new ConnectionManager("connection-manager");
+    private final ConnectionManager connectionManager = new ConnectionManager("Connection Manager");
 
     /**
      * todo
-     * @param address
+     *
+     * @param mappings
      * @param backlog
      */
-    public ProxyServer(SocketAddress address, int backlog) {
-        this(ServerSocketChannelFactory.DEFAULT, address, backlog, SocketChannelFactory.DEFAULT);
+    public ProxyServer(Collection<PortMapping> mappings, int backlog) {
+        this(ServerSocketChannelFactory.DEFAULT, SocketChannelFactory.DEFAULT, mappings, backlog);
     }
 
     /**
      * Creates new instance of proxy server.
      *
-     * @param serverSocketFactory Factory for creating server socket channels.
-     * @param address Bind address.
-     * @param backlog Maximum number of pending connections. If value is 0 or less, OS default value will be used.
+     * @param serverSocketFactory  Factory for creating server socket channels.
+     * @param socketChannelFactory Factory for creating connections to remote servers.
+     * @param mappings             Collection of TCP port mappings.
+     * @param backlog              Maximum number of pending incoming connections on each listen port.
+     *                             If value is 0 or less, OS default value will be used.
      */
-    public ProxyServer(NetworkChannelFactory<ServerSocketChannel> serverSocketFactory, SocketAddress address, int backlog,
-                       NetworkChannelFactory<SocketChannel> socketChannelFactory) {
+    public ProxyServer(NetworkChannelFactory<ServerSocketChannel> serverSocketFactory,
+                       NetworkChannelFactory<SocketChannel> socketChannelFactory,
+                       Collection<PortMapping> mappings,
+                       int backlog) {
         this.serverSocketFactory = serverSocketFactory;
-        this.address = address;
         this.backlog = backlog;
         this.socketFactory = socketChannelFactory;
+        this.mappings = mappings;
     }
 
     /**
@@ -98,27 +109,34 @@ public class ProxyServer {
      * @throws IllegalStateException If server already started.
      */
     public void start() throws IOException {
-        if (this.channel != null)
+        if (selector != null)
             throw new IllegalStateException("Server already started");
 
-        ServerSocketChannel channel0;
-
         synchronized (mutex) {
-            if (this.channel != null)
+            if (selector != null)
                 throw new IllegalStateException("Server already started");
 
-            this.channel = channel0 = serverSocketFactory.newChannel();
+            selector = Selector.open();
         }
 
-        channel0.configureBlocking(false);
+        for (PortMapping mapping : mappings) {
+            if (mapping.localAddress().isUnresolved() || mapping.remoteAddress().isUnresolved()) {
+                LOGGER.warning("Skipped mapping " + mapping + " since it has unresolved address");
+                continue;
+            }
 
-        selector = Selector.open();
+            ServerSocketChannel channel = serverSocketFactory.newChannel();
 
-        channel0.register(selector, SelectionKey.OP_ACCEPT);
+            channels.put(channel, mapping);
 
-        channel0.bind(address, backlog);
+            channel.configureBlocking(false);
 
-        LOGGER.info("Start listening on " + address + " with backlog: " + backlog);
+            channel.register(selector, SelectionKey.OP_ACCEPT);
+
+            channel.bind(mapping.localAddress(), backlog);
+
+            LOGGER.info("Start listening on " + mapping.localAddress() + " for " + mapping.remoteAddress());
+        }
 
         connectionManager.start();
     }
@@ -129,23 +147,33 @@ public class ProxyServer {
      * @throws IOException
      */
     public void shutdown() throws IOException {
-        ServerSocketChannel channel0 = this.channel;
+        Selector selector0 = selector;
 
-        if (channel0 == null || !channel0.isOpen())
+        if (selector0 == null || !selector0.isOpen())
             throw new IllegalStateException("Server is not started");
 
         synchronized (mutex) {
-            if (!channel0.isOpen())
+            if (!selector0.isOpen())
                 throw new IllegalStateException("Server is not started");
 
-            channel0.close();
+            selector0.close();
         }
 
         connectionManager.interrupt();
     }
 
+    /**
+     * todo
+     *
+     * @return
+     */
+    public Collection<PortMapping> mappings() {
+        return Collections.unmodifiableCollection(mappings);
+    }
+
     private void onAccept(SelectionKey key) throws IOException {
-        SocketChannel acceptedChannel = channel.accept();
+        ServerSocketChannel originateChannel = (ServerSocketChannel) key.channel();
+        SocketChannel acceptedChannel = originateChannel.accept();
         SocketChannel mappedChannel = socketFactory.newChannel();
 
         acceptedChannel.configureBlocking(false);
@@ -157,16 +185,11 @@ public class ProxyServer {
                 SelectionKey.OP_CONNECT | SelectionKey.OP_READ,
                 acceptedChannel);
 
-        InetSocketAddress remote = new InetSocketAddress("ya.ru", 80);
+        InetSocketAddress remote = channels.get(originateChannel).remoteAddress();
 
-        if (remote.isUnresolved()) {
-            LOGGER.severe("Closing connection due to failed to resolve remote: " + remote);
-            acceptedChannel.close();
-            mappedChannel.close();
-        } else {
-            mappedChannel.connect(remote);
-            LOGGER.info("Incoming connection from: " + acceptedChannel.getRemoteAddress());
-        }
+        mappedChannel.connect(remote);
+
+        LOGGER.fine("Incoming connection from: " + acceptedChannel.getRemoteAddress());
     }
 
     private void onConnect(SelectionKey key) throws IOException {
@@ -177,7 +200,7 @@ public class ProxyServer {
                     "Closing originating connection.");
             ((SocketChannel) key.attachment()).close();
         } else
-            LOGGER.info("Established connection with remote: " + socketChannel.getRemoteAddress());
+            LOGGER.fine("Established connection with remote: " + socketChannel.getRemoteAddress());
     }
 
     private void onDataAvailable(SelectionKey key) throws IOException {
@@ -192,7 +215,7 @@ public class ProxyServer {
         int read = originateChannel.read(buf);
 
         if (read == -1) {
-            LOGGER.info("Connection with " + originateChannel.getRemoteAddress() + " has been closed");
+            LOGGER.fine("Connection with " + originateChannel.getRemoteAddress() + " has been closed");
             try {
                 originateChannel.close();
             } finally {
@@ -257,9 +280,10 @@ public class ProxyServer {
         String configUrl0 = System.getProperty("tcproxy.config.url", "classpath:/proxy.properties");
 
         URL configUrl = null;
+
         try {
             configUrl = configUrl0.startsWith("classpath:") ?
-                    ProxyServer.class.getResource(configUrl0.substring(10)):
+                    ProxyServer.class.getResource(configUrl0.substring(10)) :
                     new URL(configUrl0);
 
             if (configUrl == null)
@@ -290,10 +314,8 @@ public class ProxyServer {
             System.exit(1);
         }
 
-        PortMapping first = config.mappings().iterator().next();
-
         ProxyServer server =
-                new ProxyServer(first.localAddress(), Integer.getInteger("tcproxy.accept.backlog", -1));
+                new ProxyServer(config.mappings(), Integer.getInteger("tcproxy.accept.backlog", -1));
 
         logger.info("Starting TCP proxy server...");
 
