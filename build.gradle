@@ -1,7 +1,11 @@
 apply plugin: 'java'
+apply plugin: 'application'
 
 sourceCompatibility = 1.7
 version = '1.0'
+
+mainClassName = "me.azhuchkov.tcproxy.ProxyServer"
+applicationDefaultJvmArgs = ["-Djava.net.preferIPv4Stack=true"]
 
 repositories {
     mavenCentral()
@@ -9,4 +13,10 @@ repositories {
 
 dependencies {
     testCompile group: 'junit', name: 'junit', version: '4.11'
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': mainClassName
+    }
 }

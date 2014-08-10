@@ -137,7 +137,7 @@ public class ProxyServer {
 
             channel.bind(mapping.localAddress(), backlog);
 
-            LOGGER.info("Start listening on " + mapping.localAddress() + " for " + mapping.remoteAddress());
+            LOGGER.info("Start listening on " + mapping.localAddress() + " mapped to " + mapping.remoteAddress());
         }
 
         connectionManager.start();
