@@ -75,6 +75,8 @@ public class ProxyServer {
      */
     private final ConnectionManager connectionManager = new ConnectionManager("Connection Manager");
 
+    private final ByteBuffer buf = ByteBuffer.allocateDirect(16384);
+
     /**
      * todo
      *
@@ -206,8 +208,6 @@ public class ProxyServer {
     }
 
     private void onDataAvailable(SelectionKey key) throws IOException {
-        ByteBuffer buf = ByteBuffer.allocate(32);
-
         SocketChannel originateChannel = (SocketChannel) key.channel();
         SocketChannel pipedChannel = (SocketChannel) key.attachment();
 
@@ -218,23 +218,23 @@ public class ProxyServer {
 
         if (read == -1) {
             LOGGER.fine("Connection with " + originateChannel.getRemoteAddress() + " has been closed");
+
             try {
                 originateChannel.close();
             } finally {
                 pipedChannel.close();
             }
+
+            return;
         }
 
-        while (read > 0) {
-            buf.flip();
+        buf.flip();
 
-            while (buf.hasRemaining())
-                pipedChannel.write(buf);
+        while (buf.hasRemaining())
+            if (pipedChannel.write(buf) == 0)
+                LOGGER.warning("Failed to drain buffer");
 
-            buf.clear();
-
-            read = originateChannel.read(buf);
-        }
+        buf.clear();
     }
 
     /**
@@ -256,6 +256,10 @@ public class ProxyServer {
 
                     for (Iterator<SelectionKey> iter = selector.selectedKeys().iterator(); iter.hasNext(); ) {
                         SelectionKey key = iter.next();
+                        iter.remove();
+
+                        if (!key.isValid())
+                            continue;
 
                         if (key.isAcceptable())
                             onAccept(key);
@@ -265,8 +269,6 @@ public class ProxyServer {
                             onDataAvailable(key);
                         else
                             throw new RuntimeException("unsupported event selected: " + key);
-
-                        iter.remove();
                     }
                 }
             } catch (IOException e) {
