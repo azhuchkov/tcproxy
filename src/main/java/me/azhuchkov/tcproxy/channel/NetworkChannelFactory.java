@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.SocketOption;
 import java.nio.channels.NetworkChannel;
 import java.util.Map;
+import java.util.logging.Logger;
 
 /**
  * Abstract network socket channel factory.
@@ -36,16 +37,28 @@ public abstract class NetworkChannelFactory<T extends NetworkChannel> {
     protected abstract T newChannel0() throws IOException;
 
     /**
-     * Creates new channel with given options.
+     * Creates new channel with given options. Invalid and unsupported options will be ignored
+     * and warning message would be logged.
      *
      * @return Network channel.
-     * @throws IOException If failed.
+     * @throws IOException If an I/O error occurs.
      */
     public T newChannel() throws IOException {
         T channel = newChannel0();
 
         for (Map.Entry<SocketOption<Object>, Object> entry : options.entrySet()) {
-            channel.setOption(entry.getKey(), entry.getValue());
+            SocketOption<Object> option = entry.getKey();
+            Object value = entry.getValue();
+
+            try {
+                channel.setOption(option, value);
+            } catch (IllegalArgumentException | UnsupportedOperationException e) {
+                String message = e instanceof IllegalArgumentException ?
+                        "Invalid value " + value + " for option " + option + ": " + e.getMessage() :
+                        "Unsupported option " + option + ": " + e.getMessage();
+
+                Logger.getLogger(getClass().getName()).warning(message);
+            }
         }
 
         return channel;
