@@ -14,6 +14,11 @@ import java.util.logging.Logger;
  */
 public abstract class NetworkChannelFactory<T extends NetworkChannel> {
     /**
+     * Factory logger.
+     */
+    private final Logger logger = Logger.getLogger(getClass().getName());
+
+    /**
      * Socket channel options.
      */
     protected final Map<SocketOption<Object>, Object> options;
@@ -46,6 +51,28 @@ public abstract class NetworkChannelFactory<T extends NetworkChannel> {
     public T newChannel() throws IOException {
         T channel = newChannel0();
 
+        try {
+            apply(channel);
+        } catch (IOException e) {
+            try {
+                channel.close();
+            } catch (IOException e1) {
+                logger.warning("Failed to close channel: " + e);
+            }
+            throw e;
+        }
+
+        return channel;
+    }
+
+    /**
+     * Applies factory options to given channel. Invalid and unsupported options will be ignored
+     * and warning message would be logged.
+     *
+     * @param channel Network channel to apply options to.
+     * @throws IOException If I/O error occurs.
+     */
+    public void apply(T channel) throws IOException {
         for (Map.Entry<SocketOption<Object>, Object> entry : options.entrySet()) {
             SocketOption<Object> option = entry.getKey();
             Object value = entry.getValue();
@@ -53,15 +80,11 @@ public abstract class NetworkChannelFactory<T extends NetworkChannel> {
             try {
                 channel.setOption(option, value);
             } catch (IllegalArgumentException | UnsupportedOperationException e) {
-                String message = e instanceof IllegalArgumentException ?
+                logger.warning(e instanceof IllegalArgumentException ?
                         "Invalid value " + value + " for option " + option + ": " + e.getMessage() :
-                        "Unsupported option " + option + ": " + e.getMessage();
-
-                Logger.getLogger(getClass().getName()).warning(message);
+                        "Unsupported option " + option + ": " + e.getMessage());
             }
         }
-
-        return channel;
     }
 
     @Override

@@ -1,5 +1,9 @@
 package me.azhuchkov.tcproxy;
 
+import me.azhuchkov.tcproxy.acceptor.Acceptor;
+import me.azhuchkov.tcproxy.acceptor.BlockingAcceptor;
+import me.azhuchkov.tcproxy.acceptor.ConnectionHandler;
+import me.azhuchkov.tcproxy.acceptor.NonBlockingAcceptor;
 import me.azhuchkov.tcproxy.channel.NetworkChannelFactory;
 import me.azhuchkov.tcproxy.channel.ServerSocketChannelFactory;
 import me.azhuchkov.tcproxy.channel.SocketChannelFactory;
@@ -7,33 +11,49 @@ import me.azhuchkov.tcproxy.config.Configuration;
 import me.azhuchkov.tcproxy.config.ConfigurationException;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
+import java.net.StandardSocketOptions;
 import java.net.URL;
 import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.nio.channels.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * Non-blocking TCP proxy server.
+ * Consist of single acceptor for handling incoming connections and several workers
+ * that do most of the job. Acceptor may be blocking or non-blocking,
+ * workers are always in non-blocking mode. By default workers count is equal to available
+ * CPU cores amount.
  *
  * @author Andrey Zhuchkov
  *         Date: 08.08.14
  */
 public class ProxyServer {
     /**
-     * Logger.
+     * Server logger.
      */
     private static final Logger LOGGER = Logger.getLogger(ProxyServer.class.getName());
+
+    /**
+     * Default backlog value.
+     */
+    public static final int DEFAULT_BACKLOG = -1;
+
+    /**
+     * Default size of transfer buffer.
+     */
+    public static final int DEFAULT_BUFFER_SIZE = 8192;
+
+    /**
+     * Default workers count.
+     */
+    public static final int DEFAULT_WORKERS_COUNT = Runtime.getRuntime().availableProcessors();
 
     /**
      * Server socket channel factory.
@@ -46,45 +66,37 @@ public class ProxyServer {
     private final NetworkChannelFactory<SocketChannel> socketFactory;
 
     /**
-     * TCP port mappings.
-     */
-    private final Collection<PortMapping> mappings;
-
-    /**
-     * todo
-     */
-    private final ConcurrentMap<ServerSocketChannel, PortMapping> channels = new ConcurrentHashMap<>();
-
-    /**
-     * Maximum number of pending connections.
+     * Maximum number of pending incoming connections.
      */
     private final int backlog;
 
     /**
-     * Server lifecycle mutex.
+     * Transfer buffer size.
      */
-    private final Object mutex = new Object();
+    private final int bufferSize;
 
     /**
-     * todo
+     * Incoming connections acceptor.
      */
-    private volatile Selector selector;
+    private final Acceptor acceptor;
 
     /**
-     * Main background thread that manages all the events.
+     * Workers that serves connection events.
      */
-    private final ConnectionManager connectionManager = new ConnectionManager("Connection Manager");
-
-    private final ByteBuffer buf = ByteBuffer.allocateDirect(16384);
+    private final Worker[] workers;
 
     /**
-     * todo
-     *
-     * @param mappings
-     * @param backlog
+     * TCP port mappings by its channel.
      */
-    public ProxyServer(Collection<PortMapping> mappings, int backlog) {
-        this(ServerSocketChannelFactory.DEFAULT, SocketChannelFactory.DEFAULT, mappings, backlog);
+    private volatile Map<ServerSocketChannel, PortMapping> mappings;
+
+    /**
+     * Creates new server with default backlog value, default socket options, buffer size 8192,
+     * non-blocking acceptor and amount of workers that equal to available CPU cores.
+     */
+    public ProxyServer() {
+        this(ServerSocketChannelFactory.DEFAULT, SocketChannelFactory.DEFAULT, DEFAULT_BACKLOG,
+                DEFAULT_BUFFER_SIZE, DEFAULT_WORKERS_COUNT, false);
     }
 
     /**
@@ -92,192 +104,416 @@ public class ProxyServer {
      *
      * @param serverSocketFactory  Factory for creating server socket channels.
      * @param socketChannelFactory Factory for creating connections to remote servers.
-     * @param mappings             Collection of TCP port mappings.
      * @param backlog              Maximum number of pending incoming connections on each listen port.
      *                             If value is 0 or less, OS default value will be used.
+     * @param bufferSize           Transfer buffer size.
+     * @param workers              Count of workers.
+     * @param blockingAcceptor     Whether blocking I/O acceptor should be used.
      */
     public ProxyServer(NetworkChannelFactory<ServerSocketChannel> serverSocketFactory,
                        NetworkChannelFactory<SocketChannel> socketChannelFactory,
-                       Collection<PortMapping> mappings,
-                       int backlog) {
+                       int backlog,
+                       int bufferSize,
+                       int workers,
+                       boolean blockingAcceptor) {
+        if (bufferSize <= 0)
+            throw new IllegalArgumentException("invalid buffer size");
+
+        if (workers <= 0)
+            throw new IllegalArgumentException("invalid workers count");
+
         this.serverSocketFactory = serverSocketFactory;
         this.backlog = backlog;
+        this.bufferSize = bufferSize;
         this.socketFactory = socketChannelFactory;
-        this.mappings = mappings;
+
+        this.workers = new Worker[workers];
+
+        for (int i = 0; i < this.workers.length; i++) {
+            this.workers[i] = new Worker("Proxy TCP Dispatcher-" + i);
+        }
+
+        ConnectionHandler handler = new ConnectionHandler() {
+            @Override
+            public void handle(ServerSocketChannel originateChannel, SocketChannel acceptedChannel) {
+                onAccept(originateChannel, acceptedChannel);
+            }
+        };
+
+        // 'this' leakage is safe since acceptor is private
+        this.acceptor = blockingAcceptor ?
+                new BlockingAcceptor("Proxy TCP Acceptor-", handler) :
+                new NonBlockingAcceptor("Proxy TCP Acceptor", handler);
     }
 
     /**
-     * Starts server: opens channel and do bind.
+     * Starts server.
      *
+     * @param portMappings Collection of mappings.
      * @throws IOException           If failed.
      * @throws IllegalStateException If server already started.
      */
-    public void start() throws IOException {
-        if (selector != null)
-            throw new IllegalStateException("Server already started");
+    public void start(Collection<PortMapping> portMappings) throws IOException {
+        if (mappings != null)
+            throw new IllegalStateException("already started");
 
-        synchronized (mutex) {
-            if (selector != null)
-                throw new IllegalStateException("Server already started");
+        synchronized (this) {
+            if (mappings != null)
+                throw new IllegalStateException("already started");
 
-            selector = Selector.open();
+            mappings = new HashMap<>(portMappings.size());
         }
 
-        for (PortMapping mapping : mappings) {
-            if (mapping.localAddress().isUnresolved() || mapping.remoteAddress().isUnresolved()) {
+        for (PortMapping mapping : portMappings) {
+            if (mapping.remoteAddress().isUnresolved()) {
                 LOGGER.warning("Skipped mapping " + mapping + " since it has unresolved address");
                 continue;
             }
 
             ServerSocketChannel channel = serverSocketFactory.newChannel();
 
-            channels.put(channel, mapping);
-
-            channel.configureBlocking(false);
-
-            channel.register(selector, SelectionKey.OP_ACCEPT);
-
-            channel.bind(mapping.localAddress(), backlog);
-
-            LOGGER.info("Start listening on " + mapping.localAddress() + " mapped to " + mapping.remoteAddress());
-        }
-
-        connectionManager.start();
-    }
-
-    /**
-     * todo
-     *
-     * @throws IOException
-     */
-    public void shutdown() throws IOException {
-        Selector selector0 = selector;
-
-        if (selector0 == null || !selector0.isOpen())
-            throw new IllegalStateException("Server is not started");
-
-        synchronized (mutex) {
-            if (!selector0.isOpen())
-                throw new IllegalStateException("Server is not started");
-
-            selector0.close();
-        }
-
-        connectionManager.interrupt();
-    }
-
-    /**
-     * todo
-     *
-     * @return
-     */
-    public Collection<PortMapping> mappings() {
-        return Collections.unmodifiableCollection(mappings);
-    }
-
-    private void onAccept(SelectionKey key) throws IOException {
-        ServerSocketChannel originateChannel = (ServerSocketChannel) key.channel();
-        SocketChannel acceptedChannel = originateChannel.accept();
-        SocketChannel mappedChannel = socketFactory.newChannel();
-
-        acceptedChannel.configureBlocking(false);
-        acceptedChannel.register(selector, SelectionKey.OP_READ, mappedChannel);
-
-        mappedChannel.configureBlocking(false);
-        mappedChannel.register(
-                selector,
-                SelectionKey.OP_CONNECT | SelectionKey.OP_READ,
-                acceptedChannel);
-
-        InetSocketAddress remote = channels.get(originateChannel).remoteAddress();
-
-        mappedChannel.connect(remote);
-
-        LOGGER.fine("Incoming connection from: " + acceptedChannel.getRemoteAddress());
-    }
-
-    private void onConnect(SelectionKey key) throws IOException {
-        SocketChannel socketChannel = (SocketChannel) key.channel();
-
-        if (!socketChannel.finishConnect()) {
-            LOGGER.severe("Failed to connect to remote destination. " +
-                    "Closing originating connection.");
-            ((SocketChannel) key.attachment()).close();
-        } else
-            LOGGER.fine("Established connection with remote: " + socketChannel.getRemoteAddress());
-    }
-
-    private void onDataAvailable(SelectionKey key) throws IOException {
-        SocketChannel originateChannel = (SocketChannel) key.channel();
-        SocketChannel pipedChannel = (SocketChannel) key.attachment();
-
-        if (pipedChannel.isConnectionPending())
-            return;
-
-        int read = originateChannel.read(buf);
-
-        if (read == -1) {
-            LOGGER.fine("Connection with " + originateChannel.getRemoteAddress() + " has been closed");
-
             try {
-                originateChannel.close();
-            } finally {
-                pipedChannel.close();
+                channel.bind(mapping.localAddress(), backlog);
+            } catch (IOException e) {
+                LOGGER.log(Level.SEVERE, "Failed to bind: " + mapping.localAddress(), e);
+
+                continue;
             }
 
+            LOGGER.info("Start listening on " + mapping.localAddress() + " mapped to " + mapping.remoteAddress());
+
+            mappings.put(channel, mapping);
+        }
+
+        for (Worker worker : workers)
+            worker.start();
+
+        try {
+            for (Worker worker : workers)
+                worker.initLatch.await();
+        } catch (InterruptedException e) {
+            for (Worker worker : workers)
+                worker.interrupt();
+
             return;
         }
 
-        buf.flip();
-
-        while (buf.hasRemaining())
-            if (pipedChannel.write(buf) == 0)
-                LOGGER.warning("Failed to drain buffer");
-
-        buf.clear();
+        acceptor.start(mappings.keySet());
     }
 
     /**
-     * Thread that manages connections: accepting incoming ones, disconnects handling, etc.
+     * Shutdowns the server.
+     *
+     * @throws InterruptedException  If shutdown process is interrupted.
+     * @throws IllegalStateException If server is not started.
      */
-    private class ConnectionManager extends Thread {
-        private ConnectionManager(String name) {
+    public void shutdown() throws InterruptedException {
+        if (mappings == null)
+            throw new IllegalStateException("not started");
+
+        Collection<ServerSocketChannel> channels;
+
+        synchronized (this) {
+            if (mappings == null)
+                throw new IllegalStateException("not started");
+
+            channels = mappings.keySet();
+
+            mappings = null;
+        }
+
+        try {
+            acceptor.interrupt();
+        } finally {
+            for (ServerSocketChannel channel : channels)
+                close(channel);
+
+            for (Worker worker : workers)
+                worker.interrupt();
+
+            for (Worker worker : workers)
+                worker.join();
+        }
+    }
+
+    /**
+     * Handles incoming connections.
+     *
+     * @param originateChannel Channel that accepted new connection.
+     * @param channel          Accepted connection channel.
+     */
+    private void onAccept(ServerSocketChannel originateChannel, SocketChannel channel) {
+        SocketChannel mappedChannel = null;
+
+        try {
+            socketFactory.apply(channel);
+            channel.configureBlocking(false);
+
+            mappedChannel = socketFactory.newChannel();
+            mappedChannel.configureBlocking(false);
+
+            mappedChannel.connect(mappings.get(originateChannel).remoteAddress());
+        } catch (IOException e) {
+            LOGGER.warning("Failed to handle incoming connection. Closing it... (" + e + ")");
+
+            close(channel);
+
+            if (mappedChannel != null)
+                close(mappedChannel);
+
+            return;
+        }
+
+        Session originateSession = new Session(channel);
+        Session mappedSession = new Session(mappedChannel);
+
+        originateSession.link(mappedSession);
+
+        Worker worker = workers[ThreadLocalRandom.current().nextInt(workers.length)];
+
+        worker.register(channel, originateSession, mappedChannel, mappedSession);
+    }
+
+    /**
+     * Handles outgoing connection establishment.
+     *
+     * @param key Selection key.
+     * @throws IOException If I/O error occurs.
+     */
+    private void onConnect(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+
+        if (channel.finishConnect())
+            key.interestOps(key.interestOps() & ~SelectionKey.OP_CONNECT | SelectionKey.OP_READ);
+    }
+
+    /**
+     * Handles received data. This method also invoked on disconnects.
+     *
+     * @param key Selection key.
+     * @throws IOException If I/O error occurs.
+     */
+    private void onRead(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+        Session linked = ((Session) key.attachment()).linked;
+
+        if (linked.pending != null)
+            throw new RuntimeException("pending data must be flushed");
+
+        ByteBuffer buffer = ByteBuffer.allocateDirect(bufferSize);
+
+        int read = channel.read(buffer);
+
+        buffer.flip();
+
+        if (read == 0)
+            return;
+
+        if (read < 0) {
+            close(channel);
+            close(linked.channel);
+
+            return;
+        }
+
+        if (linked.channel.isConnected())
+            linked.channel.write(buffer);
+
+        if (buffer.hasRemaining()) {
+            linked.pending = buffer;
+
+            key.interestOps(key.interestOps() & ~SelectionKey.OP_READ);
+
+            SelectionKey linkedKey = linked.channel.keyFor(key.selector());
+
+            linkedKey.interestOps(linkedKey.interestOps() | SelectionKey.OP_WRITE);
+        }
+    }
+
+    /**
+     * Handles channel write readiness.
+     *
+     * @param key Selection key.
+     * @throws IOException If I/O error occurs.
+     */
+    private void onWrite(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+        Session session = ((Session) key.attachment());
+
+        if (session.pending == null)
+            throw new RuntimeException("expected pending data");
+
+        channel.write(session.pending);
+
+        if (session.pending.hasRemaining())
+            return;
+
+        session.pending = null;
+
+        key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
+
+        SelectionKey linkedKey = session.linked.channel.keyFor(key.selector());
+
+        linkedKey.interestOps(linkedKey.interestOps() | SelectionKey.OP_READ);
+    }
+
+    /**
+     * Worker.
+     */
+    private class Worker extends Thread {
+        private final Queue<Registration> pending = new ConcurrentLinkedQueue<>();
+
+        private final CountDownLatch initLatch = new CountDownLatch(1);
+
+        private final AtomicBoolean awakened = new AtomicBoolean(false);
+
+        private volatile Selector selector;
+
+        Worker(String name) {
             super(name);
+        }
+
+        private class Registration {
+            final SocketChannel channel1;
+            final Session session1;
+
+            final SocketChannel channel2;
+            final Session session2;
+
+            private Registration(SocketChannel channel1, Session session1,
+                                 SocketChannel channel2, Session session2) {
+                this.channel1 = channel1;
+                this.session1 = session1;
+                this.channel2 = channel2;
+                this.session2 = session2;
+            }
+        }
+
+        void register(SocketChannel channel1, Session session1, SocketChannel channel2, Session session2) {
+            pending.add(new Registration(channel1, session1, channel2, session2));
+
+            // it seems that wakeup() performs quite slowly
+            if (awakened.compareAndSet(false, true))
+                selector.wakeup();
         }
 
         @Override
         public void run() {
             try {
-                while (!isInterrupted()) {
-                    int selected = selector.select();
+                selector = Selector.open();
 
-                    if (selected == 0)
-                        continue;
+                initLatch.countDown();
+
+                while (!isInterrupted()) {
+                    awakened.set(false);
+
+                    selector.select();
+
+                    if (isInterrupted())
+                        break;
 
                     for (Iterator<SelectionKey> iter = selector.selectedKeys().iterator(); iter.hasNext(); ) {
-                        SelectionKey key = iter.next();
+                        final SelectionKey key = iter.next();
+
                         iter.remove();
 
-                        if (!key.isValid())
-                            continue;
+                        try {
+                            if (key.isValid() && key.isConnectable()) {
+                                onConnect(key);
+                            }
 
-                        if (key.isAcceptable())
-                            onAccept(key);
-                        else if (key.isConnectable())
-                            onConnect(key);
-                        else if (key.isReadable())
-                            onDataAvailable(key);
-                        else
-                            throw new RuntimeException("unsupported event selected: " + key);
+                            if (key.isValid() && key.isReadable()) {
+                                onRead(key);
+                            }
+
+                            if (key.isValid() && key.isWritable()) {
+                                onWrite(key);
+                            }
+                        } catch (IOException e) {
+                            LOGGER.warning("Failed to handle I/O event: " + e);
+
+                            Session session = (Session) key.attachment();
+
+                            close(session.channel);
+                            close(session.linked.channel);
+                        }
+                    }
+
+                    Registration registration;
+
+                    while ((registration = pending.poll()) != null) {
+                        SocketChannel channel1 = registration.channel1;
+
+                        channel1.register(
+                                selector,
+                                channel1.isConnected() ? SelectionKey.OP_READ : SelectionKey.OP_CONNECT,
+                                registration.session1
+                        );
+
+                        SocketChannel channel2 = registration.channel2;
+
+                        channel2.register(
+                                selector,
+                                channel2.isConnected() ? SelectionKey.OP_READ : SelectionKey.OP_CONNECT,
+                                registration.session2
+                        );
                     }
                 }
             } catch (IOException e) {
-                LOGGER.severe("Unexpected error occurs: " + e);
-                e.printStackTrace();
+                LOGGER.log(Level.SEVERE, "Unexpected I/O error occurs", e);
+            } finally {
+                if (selector != null) {
+                    for (SelectionKey key : selector.keys())
+                        close(key.channel());
+
+                    try {
+                        selector.close();
+                    } catch (IOException e) {
+                        LOGGER.warning("Failed to close selector: " + e);
+                    }
+                }
             }
         }
     }
 
+    /**
+     * Channel session object. Correctness provided by passing it to worker through
+     * concurrent queue and further handling in single thread.
+     */
+    private static class Session {
+        private final SocketChannel channel;
+        private ByteBuffer pending;
+
+        private Session linked;
+
+        private Session(SocketChannel channel) {
+            this.channel = channel;
+        }
+
+        public void link(Session session) {
+            linked = session;
+            session.linked = this;
+        }
+    }
+
+    /**
+     * Closes channel suppressing I/O error if any. Error would be reported in log.
+     *
+     * @param channel Channel to close.
+     */
+    private static void close(Channel channel) {
+        try {
+            channel.close();
+        } catch (IOException e) {
+            LOGGER.warning("Failed to close channel: " + e);
+        }
+    }
+
+    /**
+     * Entry point.
+     *
+     * @param args Command line arguments.
+     */
     public static void main(String[] args) {
         final Logger logger = Logger.getLogger("");
 
@@ -318,13 +554,44 @@ public class ProxyServer {
             System.exit(1);
         }
 
-        ProxyServer server =
-                new ProxyServer(config.mappings(), Integer.getInteger("tcproxy.accept.backlog", -1));
+        NetworkChannelFactory.Builder<ServerSocketChannelFactory> serverFactoryBuilder =
+                ServerSocketChannelFactory.create();
+
+        String reuseAddr = System.getProperty("tcproxy.accept.reuseAddress");
+
+        if (reuseAddr != null)
+            serverFactoryBuilder.option(StandardSocketOptions.SO_REUSEADDR, "true".equals(reuseAddr));
+
+        NetworkChannelFactory.Builder<SocketChannelFactory> socketFactoryBuilder =
+                SocketChannelFactory.create();
+
+        String sendBufSize = System.getProperty("tcproxy.conn.sendBuf");
+
+        if (sendBufSize != null)
+            socketFactoryBuilder.option(StandardSocketOptions.SO_SNDBUF, Integer.valueOf(sendBufSize));
+
+        String rcvBufSize = System.getProperty("tcproxy.conn.receiveBuf");
+
+        if (rcvBufSize != null)
+            socketFactoryBuilder.option(StandardSocketOptions.SO_RCVBUF, Integer.valueOf(rcvBufSize));
+
+        socketFactoryBuilder
+                .option(StandardSocketOptions.TCP_NODELAY, Boolean.getBoolean("tcproxy.conn.noDelay"))
+                .option(StandardSocketOptions.SO_KEEPALIVE, Boolean.getBoolean("tcproxy.conn.keepAlive"));
+
+        final ProxyServer server = new ProxyServer(
+                serverFactoryBuilder.build(),
+                socketFactoryBuilder.build(),
+                Integer.getInteger("tcproxy.accept.backlog", DEFAULT_BACKLOG),
+                Integer.getInteger("tcproxy.conn.transferBuf", DEFAULT_BUFFER_SIZE),
+                Integer.getInteger("tcproxy.workers", DEFAULT_WORKERS_COUNT),
+                Boolean.getBoolean("tcproxy.accept.blocking")
+        );
 
         logger.info("Starting TCP proxy server...");
 
         try {
-            server.start();
+            server.start(config.mappings());
         } catch (IOException e) {
             logger.log(Level.SEVERE, "Failed to start server", e);
 
@@ -333,6 +600,17 @@ public class ProxyServer {
 
         logger.info("The server has been started successfully");
 
-//        server.shutdown();
+        Runtime.getRuntime().addShutdownHook(new Thread("Proxy Shutdown Hook") {
+            @Override
+            public void run() {
+                logger.info("Shutting down the server...");
+
+                try {
+                    server.shutdown();
+                } catch (InterruptedException e) {
+                    LOGGER.severe("Shutdown process has been interrupted");
+                }
+            }
+        });
     }
 }
