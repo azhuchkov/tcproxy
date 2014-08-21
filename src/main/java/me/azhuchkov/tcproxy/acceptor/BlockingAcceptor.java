@@ -105,7 +105,7 @@ public class BlockingAcceptor implements Acceptor {
             } catch (ClosedByInterruptException e) {
                 // just exit
             } catch (IOException e) {
-                LOGGER.log(Level.SEVERE, "Incoming connections acceptor failure. Exiting...", e);
+                LOGGER.log(Level.SEVERE, "Incoming connections acceptor failure.", e);
             }
         }
     }

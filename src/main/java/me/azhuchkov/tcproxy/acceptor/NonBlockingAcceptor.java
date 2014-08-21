@@ -81,7 +81,7 @@ public class NonBlockingAcceptor extends Thread implements Acceptor {
                 }
             }
         } catch (IOException e) {
-            LOGGER.log(Level.SEVERE, "Incoming connections acceptor failure. Exiting...", e);
+            LOGGER.log(Level.SEVERE, "Incoming connections acceptor failure.", e);
         }
     }
 }
