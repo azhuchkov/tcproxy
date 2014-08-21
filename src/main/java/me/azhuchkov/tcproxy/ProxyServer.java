@@ -300,7 +300,7 @@ public class ProxyServer {
         if (linked.pending != null)
             throw new RuntimeException("pending data must be flushed");
 
-        ByteBuffer buffer = ByteBuffer.allocateDirect(bufferSize);
+        ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
 
         int read = channel.read(buffer);
 
