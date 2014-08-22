@@ -1,0 +1,53 @@
+================================================================
+                        TCP Port Mapper
+  Maps local ports to remote endpoints using non-blocking I/O.
+  Similar to SOCKS proxy, but without protocol support - each
+  local port statically mapped to particular endpoint.
+  For example, you can map local port 8080 to google.com:80 and
+  8022 to domain.com:22. Each connection to 8080 will be
+  transparently proxied to Google server. The same would be
+  done for 8022. The mappings can be set in configuration file.
+================================================================
+
+Requirements
+------------
+
+JDK 1.7
+
+
+Building
+--------
+The most simple way to build the application is to use Gradle wrapper
+that bootstraps itself and then do the job:
+
+$ ./gradlew build
+
+
+Running
+-------
+
+After the app is built, it's possible to run it:
+
+$ java -jar build/libs/tcp-proxy-{version}.jar
+
+To run it as a part of build lifecycle:
+
+$ ./gradlew run
+
+NOTE: Hit <ctrl+c> to shutdown.
+
+
+Packaging
+---------
+
+To build application with its configuration and all related stuff:
+
+$ ./gradlew installApp
+
+After that you can find application under 'build/install/tcp-proxy/' directory.
+
+To bundle application into archive:
+
+$ ./gradlew { distTar | distZip }
+
+Archives can be found under 'build/distributions'.
