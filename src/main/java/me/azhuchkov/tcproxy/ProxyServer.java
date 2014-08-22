@@ -26,73 +26,53 @@ import java.util.logging.Logger;
 
 /**
  * Non-blocking TCP proxy server.
+ * <p/>
+ * Doesn't support any protocol like SOCKS - just maps local ports to remote endpoints.
  * Consist of single acceptor for handling incoming connections and several workers
- * that do most of the job. Acceptor may be blocking or non-blocking,
- * workers are always in non-blocking mode. By default workers count is equal to available
- * CPU cores amount.
+ * that do most of the job. Acceptor may be blocking or non-blocking, workers are
+ * always in non-blocking mode.
  *
  * @author Andrey Zhuchkov
  *         Date: 08.08.14
  */
 public class ProxyServer {
-    /**
-     * Server logger.
-     */
+    /** Server logger. */
     private static final Logger LOGGER = Logger.getLogger(ProxyServer.class.getName());
 
-    /**
-     * Default backlog value.
-     */
+    /** Default backlog value. */
     public static final int DEFAULT_BACKLOG = -1;
 
-    /**
-     * Default size of transfer buffer.
-     */
+    /** Default size of transfer buffer. */
     public static final int DEFAULT_BUFFER_SIZE = 8192;
 
-    /**
-     * Default workers count.
-     */
-    public static final int DEFAULT_WORKERS_COUNT = Runtime.getRuntime().availableProcessors();
+    /** Default workers count. */
+    public static final int DEFAULT_WORKERS_COUNT = 1;
 
-    /**
-     * Server socket channel factory.
-     */
+    /** Server socket channel factory. */
     private final NetworkChannelFactory<ServerSocketChannel> serverSocketFactory;
 
-    /**
-     * Socket channel factory.
-     */
+    /** Socket channel factory. */
     private final NetworkChannelFactory<SocketChannel> socketFactory;
 
-    /**
-     * Maximum number of pending incoming connections.
-     */
+    /** Maximum number of pending incoming connections. */
     private final int backlog;
 
-    /**
-     * Transfer buffer size.
-     */
+    /** Transfer buffer size. */
     private final int bufferSize;
 
-    /**
-     * Incoming connections acceptor.
-     */
+    /** Incoming connections acceptor. */
     private final Acceptor acceptor;
 
-    /**
-     * Workers that serves connection events.
-     */
+    /** Workers that serves connection events. */
     private final Worker[] workers;
 
-    /**
-     * TCP port mappings by its channel.
-     */
+    /** TCP port mappings by its channel. */
     private volatile Map<ServerSocketChannel, PortMapping> mappings;
 
     /**
-     * Creates new server with default backlog value, default socket options, buffer size 8192,
-     * non-blocking acceptor and amount of workers that equal to available CPU cores.
+     * Creates new server with default platform backlog value, default socket options,
+     * buffer size {@link #DEFAULT_BUFFER_SIZE}, non-blocking acceptor and
+     * {@link #DEFAULT_WORKERS_COUNT} worker(s).
      */
     public ProxyServer() {
         this(ServerSocketChannelFactory.DEFAULT, SocketChannelFactory.DEFAULT, DEFAULT_BACKLOG,
@@ -176,7 +156,6 @@ public class ProxyServer {
                 channel.bind(mapping.localAddress(), backlog);
             } catch (IOException e) {
                 LOGGER.log(Level.SEVERE, "Failed to bind: " + mapping.localAddress(), e);
-
                 continue;
             }
 
@@ -194,6 +173,8 @@ public class ProxyServer {
         } catch (InterruptedException e) {
             for (Worker worker : workers)
                 worker.interrupt();
+
+            Thread.currentThread().interrupt();
 
             return;
         }
@@ -358,21 +339,31 @@ public class ProxyServer {
     }
 
     /**
-     * Worker.
+     * Worker dispatches occurred events on registered channels.
      */
     private class Worker extends Thread {
+        /** Queue of channels for registration. */
         private final Queue<Registration> pending = new ConcurrentLinkedQueue<>();
 
+        /** Latch that open when worker is ready for registering channels. */
         private final CountDownLatch initLatch = new CountDownLatch(1);
 
+        /** Flag that help to reduce count of selector wake ups. */
         private final AtomicBoolean awakened = new AtomicBoolean(false);
 
+        /** Worker selector. */
         private volatile Selector selector;
 
+        /**
+         * @param name Worker thread name.
+         */
         Worker(String name) {
             super(name);
         }
 
+        /**
+         * Registration request of new pair of sockets with their sessions.
+         */
         private class Registration {
             final SocketChannel channel1;
             final Session session1;
@@ -389,6 +380,14 @@ public class ProxyServer {
             }
         }
 
+        /**
+         * Registers new pair of channels and their sessions. Does not link sessions.
+         *
+         * @param channel1 First channel.
+         * @param session1 First channel session.
+         * @param channel2 Linked channel.
+         * @param session2 Linked channel session.
+         */
         void register(SocketChannel channel1, Session session1, SocketChannel channel2, Session session2) {
             pending.add(new Registration(channel1, session1, channel2, session2));
 
@@ -481,15 +480,27 @@ public class ProxyServer {
      * concurrent queue and further handling in single thread.
      */
     private static class Session {
+        /** Channel this session belongs to. */
         private final SocketChannel channel;
+
+        /** Pending buffer awaiting write to related channel. */
         private ByteBuffer pending;
 
+        /** Linked session (another part of proxy pipeline). */
         private Session linked;
 
+        /**
+         * @param channel Channel this session belongs to.
+         */
         private Session(SocketChannel channel) {
             this.channel = channel;
         }
 
+        /**
+         * Links two sessions of proxy pipeline.
+         *
+         * @param session Session to link with.
+         */
         public void link(Session session) {
             linked = session;
             session.linked = this;

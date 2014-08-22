@@ -11,22 +11,34 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
+ * Acceptor that listens for incoming connection using non-blocking I/O.
+ *
  * @author Andrey Zhuchkov
  *         Date: 11.08.14
  */
 public class NonBlockingAcceptor extends Thread implements Acceptor {
+    /** Logger. */
     private final static Logger LOGGER = Logger.getLogger(NonBlockingAcceptor.class.getName());
 
+    /** Handler to pass new connection to. */
     private final ConnectionHandler handler;
 
+    /** Channels that acceptor should listen for new connections. */
     private volatile Collection<ServerSocketChannel> channels;
 
+    /**
+     * Creates new acceptor.
+     *
+     * @param name    Acceptor thread name.
+     * @param handler Connection handler.
+     */
     public NonBlockingAcceptor(String name, ConnectionHandler handler) {
         super(name);
 
         this.handler = handler;
     }
 
+    /** {@inheritDoc} */
     @Override
     public void start(Collection<ServerSocketChannel> channels) {
         if (this.channels != null)
@@ -42,6 +54,7 @@ public class NonBlockingAcceptor extends Thread implements Acceptor {
         start();
     }
 
+    /** {@inheritDoc} */
     @Override
     public void run() {
         if (channels == null)

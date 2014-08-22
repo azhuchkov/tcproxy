@@ -9,23 +9,37 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
+ * Acceptor that listens for incoming connection using blocking I/O.
+ * Each socket handled by separate thread.
+ *
  * @author Andrey Zhuchkov
  *         Date: 11.08.14
  */
 public class BlockingAcceptor implements Acceptor {
+    /** Logger. */
     private final static Logger LOGGER = Logger.getLogger(BlockingAcceptor.class.getName());
 
+    /** Handler to pass new connection to. */
     private final ConnectionHandler handler;
 
+    /** Prefix for acceptor threads. */
     private final String prefix;
 
+    /** Array of acceptor threads. */
     private volatile Acceptor[] acceptors;
 
+    /**
+     * Creates new acceptor.
+     *
+     * @param prefix  Prefix for acceptor threads.
+     * @param handler Handler to pass new connections to.
+     */
     public BlockingAcceptor(String prefix, ConnectionHandler handler) {
         this.handler = handler;
         this.prefix = prefix;
     }
 
+    /** {@inheritDoc} */
     @Override
     public void start(Collection<ServerSocketChannel> channels) {
         if (acceptors != null)
@@ -53,6 +67,7 @@ public class BlockingAcceptor implements Acceptor {
             acceptor.start();
     }
 
+    /** {@inheritDoc} */
     @Override
     public void interrupt() {
         final Acceptor[] acceptors0 = acceptors;
@@ -64,6 +79,7 @@ public class BlockingAcceptor implements Acceptor {
             acceptor.interrupt();
     }
 
+    /** {@inheritDoc} */
     @Override
     public void join() throws InterruptedException {
         final Acceptor[] acceptors0 = acceptors;
@@ -75,9 +91,17 @@ public class BlockingAcceptor implements Acceptor {
             acceptor.join();
     }
 
+    /**
+     * Acceptor thread.
+     */
     private class Acceptor extends Thread {
+        /** Channel to listen connections. */
         private final ServerSocketChannel channel;
 
+        /**
+         * @param name    Thread name.
+         * @param channel Channel to listen connections.
+         */
         public Acceptor(String name, ServerSocketChannel channel) {
             super(name);
 
