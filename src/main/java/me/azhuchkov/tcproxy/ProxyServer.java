@@ -57,8 +57,8 @@ public class ProxyServer {
     /** Maximum number of pending incoming connections. */
     private final int backlog;
 
-    /** Transfer buffer size. */
-    private final int bufferSize;
+    /** Buffer pool. */
+    private final BufferPool bufferPool;
 
     /** Incoming connections acceptor. */
     private final Acceptor acceptor;
@@ -104,7 +104,7 @@ public class ProxyServer {
 
         this.serverSocketFactory = serverSocketFactory;
         this.backlog = backlog;
-        this.bufferSize = bufferSize;
+        this.bufferPool = new BufferPool(bufferSize);
         this.socketFactory = socketChannelFactory;
 
         this.workers = new Worker[workers];
@@ -281,11 +281,12 @@ public class ProxyServer {
         if (linked.pending != null)
             throw new RuntimeException("pending data must be flushed");
 
-        ByteBuffer buffer = ByteBuffer.allocate(bufferSize);
+        ByteBuffer buffer = bufferPool.getBuffer();
 
         int read = channel.read(buffer);
 
-        buffer.flip();
+        if (read < 1)
+            bufferPool.returnBuffer(buffer);
 
         if (read == 0)
             return;
@@ -296,6 +297,8 @@ public class ProxyServer {
 
             return;
         }
+
+        buffer.flip();
 
         if (linked.channel.isConnected())
             linked.channel.write(buffer);
@@ -308,6 +311,8 @@ public class ProxyServer {
             SelectionKey linkedKey = linked.channel.keyFor(key.selector());
 
             linkedKey.interestOps(linkedKey.interestOps() | SelectionKey.OP_WRITE);
+        } else {
+            bufferPool.returnBuffer(buffer);
         }
     }
 
@@ -328,6 +333,8 @@ public class ProxyServer {
 
         if (session.pending.hasRemaining())
             return;
+
+        bufferPool.returnBuffer(session.pending);
 
         session.pending = null;
 
